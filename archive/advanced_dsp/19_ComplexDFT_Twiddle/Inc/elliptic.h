@@ -1,0 +1,22 @@
+#ifndef ELLIPTIC_H
+#define ELLIPTIC_H
+
+#define NUM_SECTIONS 2
+
+/*Generated with MATLAB 
+ * Order:  4
+ * IIR: Elliptic
+ * Fs: 100000Hz
+ * Fpass: 5000
+ * Apass : 1dB
+ * Astop: 40dB*/
+float b[NUM_SECTIONS][3] = {
+{1.17381581E-02, -1.23174221E-02, 1.17381581E-02},
+{1.00000000E+00, -1.75591033E+00, 1.00000000E+00} };
+
+
+float a[NUM_SECTIONS][3] = {
+{1.00000000E+00, -1.76247270E+00, 7.94755199E-01},
+{1.00000000E+00, -1.84231257E+00, 9.36980611E-01} };
+
+#endif
