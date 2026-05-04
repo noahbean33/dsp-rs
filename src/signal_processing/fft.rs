@@ -378,6 +378,391 @@ pub fn goertzel_power(signal: &[f64], k: usize) -> f64 {
     goertzel(signal, k).norm_sqr()
 }
 
+// ─── Phase Unwrapping ─────────────────────────────────────────────────────────
+
+/// Unwrap a phase sequence by adding/subtracting 2π to remove discontinuities.
+///
+/// Adjacent phase differences larger than `π` are corrected so the result is
+/// a continuous (monotonic where appropriate) phase trajectory.
+#[must_use]
+pub fn phase_unwrap(phases: &[f64]) -> Vec<f64> {
+    if phases.is_empty() {
+        return Vec::new();
+    }
+    let mut unwrapped = Vec::with_capacity(phases.len());
+    unwrapped.push(phases[0]);
+    for i in 1..phases.len() {
+        let mut diff = phases[i] - phases[i - 1];
+        while diff > PI {
+            diff -= 2.0 * PI;
+        }
+        while diff < -PI {
+            diff += 2.0 * PI;
+        }
+        unwrapped.push(unwrapped[i - 1] + diff);
+    }
+    unwrapped
+}
+
+/// Wrap a phase sequence into the range `[-π, π)`.
+#[must_use]
+pub fn phase_wrap(phases: &[f64]) -> Vec<f64> {
+    phases
+        .iter()
+        .map(|&p| {
+            let mut w = p % (2.0 * PI);
+            if w >= PI {
+                w -= 2.0 * PI;
+            }
+            if w < -PI {
+                w += 2.0 * PI;
+            }
+            w
+        })
+        .collect()
+}
+
+// ─── Cepstrum Analysis ────────────────────────────────────────────────────────
+
+/// Compute the real cepstrum of a signal.
+///
+/// The real cepstrum is defined as the inverse DFT of the log magnitude
+/// spectrum: `c[n] = IFFT(log(|FFT(x)|))`.
+///
+/// The input is zero-padded to the next power of 2.
+/// Returns the real-valued cepstrum coefficients.
+#[must_use]
+pub fn real_cepstrum(signal: &[f64]) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let mut data = zero_pad_to_power_of_2(&real_to_complex(signal));
+    fft(&mut data);
+
+    // log magnitude spectrum → treat as real signal for IFFT
+    let mut log_mag: Vec<Complex> = data
+        .iter()
+        .map(|c| {
+            let mag = c.norm().max(1e-30);
+            Complex::new(mag.ln(), 0.0)
+        })
+        .collect();
+
+    ifft(&mut log_mag);
+    log_mag.iter().map(|c| c.re).collect()
+}
+
+/// Compute the complex cepstrum of a signal.
+///
+/// The complex cepstrum is `IFFT(log(FFT(x)))` where `log` is the complex
+/// logarithm using the unwrapped phase.
+///
+/// Returns `(cepstrum_real, cepstrum_imag)` as two separate vectors.
+#[must_use]
+pub fn complex_cepstrum(signal: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    if signal.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut data = zero_pad_to_power_of_2(&real_to_complex(signal));
+    fft(&mut data);
+
+    // Compute unwrapped phase
+    let phases: Vec<f64> = data.iter().map(|c| c.arg()).collect();
+    let unwrapped = phase_unwrap(&phases);
+
+    // Complex log: ln|X[k]| + j * unwrapped_phase[k]
+    let mut log_spectrum: Vec<Complex> = data
+        .iter()
+        .zip(unwrapped.iter())
+        .map(|(c, &ph)| {
+            let mag = c.norm().max(1e-30);
+            Complex::new(mag.ln(), ph)
+        })
+        .collect();
+
+    ifft(&mut log_spectrum);
+    let re = log_spectrum.iter().map(|c| c.re).collect();
+    let im = log_spectrum.iter().map(|c| c.im).collect();
+    (re, im)
+}
+
+// ─── Chirp Z-Transform ───────────────────────────────────────────────────────
+
+/// Compute the Chirp Z-Transform (CZT) of a signal.
+///
+/// Evaluates the Z-transform at `m` points along a spiral contour in the
+/// z-plane starting at `a` and spiralling with ratio `w`:
+///   `X[k] = Σ_{n=0}^{N-1} x[n] · A^{-n} · W^{nk}`,  k = 0, …, M-1
+///
+/// This generalises the DFT: with `a = 1` and `w = exp(-j2π/M)` it computes
+/// M equally-spaced frequency bins around the unit circle.
+///
+/// # Arguments
+/// * `signal` – input samples
+/// * `m` – number of output points
+/// * `w` – spiral ratio per output point (complex)
+/// * `a` – starting point on the contour (complex)
+///
+/// Uses Bluestein's algorithm for O(N log N) computation via FFT convolution.
+#[must_use]
+pub fn czt(signal: &[f64], m: usize, w: Complex, a: Complex) -> Vec<Complex> {
+    let n = signal.len();
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
+
+    // Total convolution length, rounded up to next power of 2
+    let conv_len = n + m - 1;
+    let mut fft_len = 1;
+    while fft_len < conv_len {
+        fft_len <<= 1;
+    }
+
+    // Pre-compute W^(k²/2) chirp coefficients
+    let chirp = |k: i64| -> Complex {
+        // W^(k²/2) = exp(j * arg(W) * k² / 2)  — note W is the ratio
+        let angle = w.arg() * (k * k) as f64 / 2.0;
+        let r = w.norm().powf((k * k) as f64 / 2.0);
+        Complex::new(r * angle.cos(), r * angle.sin())
+    };
+
+    // Build y[n] = x[n] · A^{-n} · W^{n²/2}
+    let mut yn = vec![Complex::zero(); fft_len];
+    for i in 0..n {
+        // A^{-n}: raise a to power -n
+        let a_neg_n = {
+            let angle = -a.arg() * i as f64;
+            let r = a.norm().powf(-(i as f64));
+            Complex::new(r * angle.cos(), r * angle.sin())
+        };
+        yn[i] = Complex::new(signal[i], 0.0) * a_neg_n * chirp(i as i64);
+    }
+
+    // Build h[n] = W^{-n²/2} (the chirp convolution kernel)
+    let mut hn = vec![Complex::zero(); fft_len];
+    for k in 0..m {
+        let c = chirp(k as i64);
+        // Inverse: 1/c
+        let denom = c.norm_sqr();
+        if denom > 1e-30 {
+            hn[k] = Complex::new(c.re / denom, -c.im / denom);
+        }
+    }
+    // Negative-index portion wrapped around
+    for k in 1..n {
+        let c = chirp(k as i64);
+        let denom = c.norm_sqr();
+        if denom > 1e-30 {
+            hn[fft_len - k] = Complex::new(c.re / denom, -c.im / denom);
+        }
+    }
+
+    // Convolve via FFT
+    fft(&mut yn);
+    fft(&mut hn);
+    for i in 0..fft_len {
+        yn[i] = yn[i] * hn[i];
+    }
+    ifft(&mut yn);
+
+    // Multiply output by W^{k²/2}
+    let mut result = Vec::with_capacity(m);
+    for k in 0..m {
+        result.push(yn[k] * chirp(k as i64));
+    }
+    result
+}
+
+/// Zoom FFT: compute M frequency bins in the range `[f1, f2]` Hz.
+///
+/// Uses the CZT to evaluate only the bins of interest at arbitrary resolution.
+///
+/// * `signal` – input samples
+/// * `sample_rate` – sampling frequency in Hz
+/// * `f1` – start frequency in Hz
+/// * `f2` – end frequency in Hz
+/// * `m` – number of output frequency bins
+#[must_use]
+pub fn zoom_fft(signal: &[f64], sample_rate: f64, f1: f64, f2: f64, m: usize) -> Vec<Complex> {
+    if signal.is_empty() || m == 0 || sample_rate <= 0.0 {
+        return Vec::new();
+    }
+    let n = signal.len();
+    let theta1 = 2.0 * PI * f1 / sample_rate;
+    let theta2 = 2.0 * PI * f2 / sample_rate;
+    let a = Complex::from_polar(1.0, theta1);
+    let step = if m > 1 {
+        (theta2 - theta1) / (m - 1) as f64
+    } else {
+        0.0
+    };
+    let w = Complex::from_polar(1.0, -step);
+    czt(signal, m, w, a)
+}
+
+// ─── DCT / IDCT ──────────────────────────────────────────────────────────────
+
+/// Compute the Type-II Discrete Cosine Transform.
+///
+/// `X[k] = Σ_{n=0}^{N-1} x[n] * cos(π/N * (n + 0.5) * k)`, k = 0, …, N-1
+#[must_use]
+pub fn dct_ii(signal: &[f64]) -> Vec<f64> {
+    let n = signal.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut result = vec![0.0; n];
+    for k in 0..n {
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += signal[i] * (PI / n as f64 * (i as f64 + 0.5) * k as f64).cos();
+        }
+        result[k] = sum;
+    }
+    result
+}
+
+/// Compute the inverse Type-II DCT (Type-III DCT).
+///
+/// `x[n] = (1/N) * X[0] + (2/N) * Σ_{k=1}^{N-1} X[k] * cos(π/N * k * (n + 0.5))`
+#[must_use]
+pub fn idct_ii(spectrum: &[f64]) -> Vec<f64> {
+    let n = spectrum.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut result = vec![0.0; n];
+    for i in 0..n {
+        let mut sum = spectrum[0] / 2.0;
+        for k in 1..n {
+            sum += spectrum[k] * (PI / n as f64 * k as f64 * (i as f64 + 0.5)).cos();
+        }
+        result[i] = sum * 2.0 / n as f64;
+    }
+    result
+}
+
+/// Orthonormal DCT-II.
+///
+/// Same as `dct_ii` but with orthonormal scaling so that the transform is
+/// its own inverse (up to the `idct_ii_ortho` call).
+#[must_use]
+pub fn dct_ii_ortho(signal: &[f64]) -> Vec<f64> {
+    let n = signal.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut result = dct_ii(signal);
+    let scale_0 = (1.0 / n as f64).sqrt();
+    let scale_k = (2.0 / n as f64).sqrt();
+    result[0] *= scale_0;
+    for k in 1..n {
+        result[k] *= scale_k;
+    }
+    result
+}
+
+/// Inverse orthonormal DCT-II.
+#[must_use]
+pub fn idct_ii_ortho(spectrum: &[f64]) -> Vec<f64> {
+    let n = spectrum.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let scale_0 = (1.0 / n as f64).sqrt();
+    let scale_k = (2.0 / n as f64).sqrt();
+    let mut scaled = spectrum.to_vec();
+    scaled[0] /= scale_0;
+    for k in 1..n {
+        scaled[k] /= scale_k;
+    }
+    idct_ii(&scaled)
+}
+
+// ─── FFT Shift ────────────────────────────────────────────────────────────────
+
+/// Shift zero-frequency component to the centre of the spectrum.
+///
+/// For a length-N array, this swaps the two halves so that bin N/2 moves to
+/// index 0, matching the convention used for visualising spectra.
+#[must_use]
+pub fn fft_shift(data: &[Complex]) -> Vec<Complex> {
+    let n = data.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mid = n / 2;
+    let mut out = Vec::with_capacity(n);
+    out.extend_from_slice(&data[mid..]);
+    out.extend_from_slice(&data[..mid]);
+    out
+}
+
+/// Inverse FFT shift — undoes `fft_shift`.
+#[must_use]
+pub fn ifft_shift(data: &[Complex]) -> Vec<Complex> {
+    let n = data.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mid = (n + 1) / 2;
+    let mut out = Vec::with_capacity(n);
+    out.extend_from_slice(&data[mid..]);
+    out.extend_from_slice(&data[..mid]);
+    out
+}
+
+/// Shift zero-frequency component to centre for real-valued spectra.
+#[must_use]
+pub fn fft_shift_real(data: &[f64]) -> Vec<f64> {
+    let n = data.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mid = n / 2;
+    let mut out = Vec::with_capacity(n);
+    out.extend_from_slice(&data[mid..]);
+    out.extend_from_slice(&data[..mid]);
+    out
+}
+
+/// Inverse FFT shift for real-valued spectra.
+#[must_use]
+pub fn ifft_shift_real(data: &[f64]) -> Vec<f64> {
+    let n = data.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mid = (n + 1) / 2;
+    let mut out = Vec::with_capacity(n);
+    out.extend_from_slice(&data[mid..]);
+    out.extend_from_slice(&data[..mid]);
+    out
+}
+
+// ─── Instantaneous Frequency ──────────────────────────────────────────────────
+
+/// Estimate instantaneous frequency from two successive phase arrays.
+///
+/// `inst_freq[n] = (leading_phase[n] - lagging_phase[n]) / (2π)`
+/// Result is in normalised frequency (cycles per sample).
+#[must_use]
+pub fn instantaneous_frequency(leading_phase: &[f64], lagging_phase: &[f64]) -> Vec<f64> {
+    let n = leading_phase.len().min(lagging_phase.len());
+    (0..n)
+        .map(|i| {
+            let mut diff = leading_phase[i] - lagging_phase[i];
+            while diff > PI {
+                diff -= 2.0 * PI;
+            }
+            while diff < -PI {
+                diff += 2.0 * PI;
+            }
+            diff / (2.0 * PI)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +873,167 @@ mod tests {
         let mag_at_10 = goertzel_magnitude(&signal, 10);
         assert!(mag_at_5 > 20.0);
         assert!(mag_at_10 < 1e-6);
+    }
+
+    #[test]
+    fn phase_unwrap_removes_discontinuity() {
+        // Linear ramp that wraps at π
+        let phases: Vec<f64> = (0..10)
+            .map(|i| {
+                let p = 0.4 * PI * i as f64;
+                // Wrap into [-π, π)
+                let mut w = p % (2.0 * PI);
+                if w >= PI { w -= 2.0 * PI; }
+                w
+            })
+            .collect();
+        let unwrapped = phase_unwrap(&phases);
+        // Should be monotonically increasing
+        for i in 1..unwrapped.len() {
+            assert!(unwrapped[i] >= unwrapped[i - 1] - 1e-10);
+        }
+    }
+
+    #[test]
+    fn phase_wrap_into_range() {
+        let phases = vec![0.0, PI + 0.1, -PI - 0.1, 4.0 * PI];
+        let wrapped = phase_wrap(&phases);
+        for &w in &wrapped {
+            assert!(w >= -PI && w < PI + 1e-10);
+        }
+    }
+
+    #[test]
+    fn real_cepstrum_symmetric_for_symmetric_signal() {
+        // A symmetric signal should produce a symmetric cepstrum
+        let signal = vec![1.0, 2.0, 3.0, 2.0, 1.0, 0.5, 0.5, 0.5];
+        let ceps = real_cepstrum(&signal);
+        assert!(!ceps.is_empty());
+        // First coefficient (quefrency 0) should be nonzero
+        assert!(ceps[0].abs() > 1e-10);
+    }
+
+    #[test]
+    fn complex_cepstrum_returns_correct_length() {
+        let signal = vec![1.0, 0.5, 0.25, 0.125];
+        let (re, im) = complex_cepstrum(&signal);
+        assert_eq!(re.len(), im.len());
+        // Padded to power of 2 (already 4)
+        assert_eq!(re.len(), 4);
+    }
+
+    #[test]
+    fn czt_matches_fft_on_unit_circle() {
+        // CZT with a=1, w=exp(-j2π/N) should match the standard DFT
+        let signal: Vec<f64> = (0..8)
+            .map(|i| (2.0 * PI * 2.0 * i as f64 / 8.0).sin())
+            .collect();
+        let n = signal.len();
+        let a = Complex::new(1.0, 0.0);
+        let w = Complex::from_polar(1.0, -2.0 * PI / n as f64);
+        let czt_result = czt(&signal, n, w, a);
+
+        let mut fft_data = real_to_complex(&signal);
+        fft(&mut fft_data);
+
+        for k in 0..n {
+            assert!(
+                (czt_result[k].re - fft_data[k].re).abs() < 1e-4,
+                "Mismatch at bin {k} re: czt={} fft={}",
+                czt_result[k].re, fft_data[k].re
+            );
+            assert!(
+                (czt_result[k].im - fft_data[k].im).abs() < 1e-4,
+                "Mismatch at bin {k} im: czt={} fft={}",
+                czt_result[k].im, fft_data[k].im
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_fft_detects_tone() {
+        let fs = 1000.0;
+        let n = 256;
+        let freq = 100.0;
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * freq * i as f64 / fs).sin())
+            .collect();
+        // Zoom into 80–120 Hz with 64 bins
+        let result = zoom_fft(&signal, fs, 80.0, 120.0, 64);
+        assert_eq!(result.len(), 64);
+        // Find peak bin
+        let mags: Vec<f64> = result.iter().map(|c| c.norm()).collect();
+        let peak_idx = mags
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        // Peak should be near the center (bin 32 corresponds to ~100 Hz)
+        let peak_freq = 80.0 + (120.0 - 80.0) * peak_idx as f64 / 63.0;
+        assert!((peak_freq - 100.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn dct_ii_idct_ii_roundtrip() {
+        let signal = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let dct = dct_ii(&signal);
+        let recovered = idct_ii(&dct);
+        for (a, b) in signal.iter().zip(recovered.iter()) {
+            assert!((a - b).abs() < 1e-10, "DCT roundtrip failed: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn dct_ii_ortho_roundtrip() {
+        let signal = vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0];
+        let dct = dct_ii_ortho(&signal);
+        let recovered = idct_ii_ortho(&dct);
+        for (a, b) in signal.iter().zip(recovered.iter()) {
+            assert!((a - b).abs() < 1e-8, "Ortho DCT roundtrip: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn dct_ii_dc_component() {
+        let signal = vec![2.0; 8];
+        let dct = dct_ii(&signal);
+        // DC component should be sum of all values
+        assert!((dct[0] - 16.0).abs() < 1e-10);
+        // All other coefficients should be ~0
+        for &v in &dct[1..] {
+            assert!(v.abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn fft_shift_roundtrip() {
+        let data: Vec<Complex> = (0..8)
+            .map(|i| Complex::new(i as f64, 0.0))
+            .collect();
+        let shifted = fft_shift(&data);
+        let unshifted = ifft_shift(&shifted);
+        for (a, b) in data.iter().zip(unshifted.iter()) {
+            assert!((a.re - b.re).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn fft_shift_real_swaps_halves() {
+        let data = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let shifted = fft_shift_real(&data);
+        assert_eq!(shifted, vec![3.0, 4.0, 5.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn instantaneous_frequency_constant_phase_diff() {
+        let n = 16;
+        let freq = 0.1; // normalised
+        let leading: Vec<f64> = (0..n).map(|i| 2.0 * PI * freq * (i + 1) as f64).collect();
+        let lagging: Vec<f64> = (0..n).map(|i| 2.0 * PI * freq * i as f64).collect();
+        let inst = instantaneous_frequency(&leading, &lagging);
+        for &f in &inst {
+            assert!((f - freq).abs() < 1e-10);
+        }
     }
 }

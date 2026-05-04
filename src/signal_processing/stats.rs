@@ -138,6 +138,141 @@ pub fn db_to_power(db: f64) -> f64 {
     10.0_f64.powf(db / 10.0)
 }
 
+// ─── Histogram Functions ──────────────────────────────────────────────────────
+
+/// Compute a histogram of `signal` values into `num_bins` equally-spaced bins.
+///
+/// Bins span `[min_val, max_val]`. Values outside the range are clamped to the
+/// nearest bin. Returns a vector of counts (as `f64` for easy normalisation).
+#[must_use]
+pub fn histogram(signal: &[f64], min_val: f64, max_val: f64, num_bins: usize) -> Vec<f64> {
+    if signal.is_empty() || num_bins == 0 || max_val <= min_val {
+        return Vec::new();
+    }
+    let mut bins = vec![0.0; num_bins];
+    let range = max_val - min_val;
+    for &x in signal {
+        let frac = (x - min_val) / range;
+        let idx = (frac * num_bins as f64).floor() as isize;
+        let idx = idx.max(0).min(num_bins as isize - 1) as usize;
+        bins[idx] += 1.0;
+    }
+    bins
+}
+
+/// Compute a cumulative histogram of `signal` values.
+///
+/// Each bin `i` contains the count of samples in bins `0..=i`.
+#[must_use]
+pub fn histogram_cumulative(signal: &[f64], min_val: f64, max_val: f64, num_bins: usize) -> Vec<f64> {
+    let hist = histogram(signal, min_val, max_val, num_bins);
+    if hist.is_empty() {
+        return Vec::new();
+    }
+    let mut cum = Vec::with_capacity(hist.len());
+    let mut sum = 0.0;
+    for &h in &hist {
+        sum += h;
+        cum.push(sum);
+    }
+    cum
+}
+
+/// Histogram equalisation: remap signal values so the histogram is approximately
+/// uniform over `[0, new_peak]`.
+#[must_use]
+pub fn histogram_equalize(signal: &[f64], new_peak: f64) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let n = signal.len() as f64;
+    let min_v = min(signal);
+    let max_v = max(signal);
+    if (max_v - min_v).abs() < 1e-30 {
+        return vec![new_peak / 2.0; signal.len()];
+    }
+    let num_bins = 256;
+    let cum = histogram_cumulative(signal, min_v, max_v, num_bins);
+    let range = max_v - min_v;
+
+    signal
+        .iter()
+        .map(|&x| {
+            let frac = (x - min_v) / range;
+            let idx = (frac * num_bins as f64).floor() as isize;
+            let idx = idx.max(0).min(num_bins as isize - 1) as usize;
+            cum[idx] / n * new_peak
+        })
+        .collect()
+}
+
+// ─── Peak-to-Average Ratio ────────────────────────────────────────────────────
+
+/// Peak-to-average ratio (PAR).
+///
+/// `PAR = max(|x|) / mean(|x|)`
+#[must_use]
+pub fn peak_to_average_ratio(signal: &[f64]) -> f64 {
+    if signal.is_empty() {
+        return 0.0;
+    }
+    let peak = signal.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    let avg = signal.iter().map(|x| x.abs()).sum::<f64>() / signal.len() as f64;
+    if avg < 1e-30 {
+        return 0.0;
+    }
+    peak / avg
+}
+
+/// Peak-to-average power ratio (PAPR).
+///
+/// `PAPR = max(|x|²) / mean(|x|²)`
+#[must_use]
+pub fn peak_to_average_power_ratio(signal: &[f64]) -> f64 {
+    if signal.is_empty() {
+        return 0.0;
+    }
+    let peak_sq = signal.iter().map(|x| x * x).fold(0.0_f64, f64::max);
+    let avg_sq = signal.iter().map(|x| x * x).sum::<f64>() / signal.len() as f64;
+    if avg_sq < 1e-30 {
+        return 0.0;
+    }
+    peak_sq / avg_sq
+}
+
+/// Peak-to-average power ratio in decibels.
+///
+/// `PAPR_dB = 10 * log10(PAPR)`
+#[must_use]
+pub fn peak_to_average_power_ratio_db(signal: &[f64]) -> f64 {
+    let papr = peak_to_average_power_ratio(signal);
+    if papr < 1e-30 {
+        return f64::NEG_INFINITY;
+    }
+    10.0 * papr.log10()
+}
+
+/// dBm to voltage conversion.
+///
+/// `V = sqrt(Z * 10^((dBm - 30) / 10))`
+///
+/// * `zero_dbm_level` – impedance in ohms (typically 50 Ω)
+#[must_use]
+pub fn dbm_to_voltage(dbm: f64, impedance: f64) -> f64 {
+    (impedance * 10.0_f64.powf((dbm - 30.0) / 10.0)).sqrt()
+}
+
+/// Voltage to dBm conversion.
+///
+/// `dBm = 10 * log10(V² / Z) + 30`
+#[must_use]
+pub fn voltage_to_dbm(voltage: f64, impedance: f64) -> f64 {
+    if impedance < 1e-30 {
+        return f64::NEG_INFINITY;
+    }
+    10.0 * (voltage * voltage / impedance).log10() + 30.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +368,85 @@ mod tests {
     #[test]
     fn db_to_amp_zero_is_one() {
         assert!((db_to_amp(0.0) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn histogram_uniform_distribution() {
+        // 100 values evenly spread across [0, 10)
+        let signal: Vec<f64> = (0..100).map(|i| i as f64 * 0.1).collect();
+        let hist = histogram(&signal, 0.0, 10.0, 10);
+        assert_eq!(hist.len(), 10);
+        // Each bin should have 10 samples
+        for &h in &hist {
+            assert!((h - 10.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn histogram_cumulative_last_equals_total() {
+        let signal: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let cum = histogram_cumulative(&signal, 0.0, 50.0, 5);
+        assert_eq!(cum.len(), 5);
+        assert!((*cum.last().unwrap() - 50.0).abs() < 1e-10);
+        // Should be non-decreasing
+        for i in 1..cum.len() {
+            assert!(cum[i] >= cum[i - 1]);
+        }
+    }
+
+    #[test]
+    fn histogram_equalize_range() {
+        let signal: Vec<f64> = (0..100).map(|i| (i as f64).powi(2)).collect();
+        let eq = histogram_equalize(&signal, 1.0);
+        assert_eq!(eq.len(), 100);
+        // All values should be in [0, 1]
+        for &v in &eq {
+            assert!(v >= -1e-10 && v <= 1.0 + 1e-10);
+        }
+    }
+
+    #[test]
+    fn histogram_empty_inputs() {
+        assert!(histogram(&[], 0.0, 1.0, 10).is_empty());
+        assert!(histogram_cumulative(&[], 0.0, 1.0, 10).is_empty());
+        assert!(histogram_equalize(&[], 1.0).is_empty());
+    }
+
+    #[test]
+    fn par_of_dc_is_one() {
+        let signal = vec![3.0; 100];
+        assert!((peak_to_average_ratio(&signal) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn papr_of_dc_is_one() {
+        let signal = vec![2.0; 100];
+        assert!((peak_to_average_power_ratio(&signal) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn papr_db_of_dc_is_zero() {
+        let signal = vec![1.0; 100];
+        assert!((peak_to_average_power_ratio_db(&signal) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn papr_of_sine_about_3db() {
+        use std::f64::consts::PI;
+        let signal: Vec<f64> = (0..1000)
+            .map(|i| (2.0 * PI * i as f64 / 1000.0).sin())
+            .collect();
+        let papr_db = peak_to_average_power_ratio_db(&signal);
+        // PAPR of a sine wave is 10*log10(2) ≈ 3.01 dB
+        assert!((papr_db - 3.01).abs() < 0.1);
+    }
+
+    #[test]
+    fn dbm_voltage_roundtrip() {
+        let v = 1.0; // 1 volt
+        let z = 50.0;
+        let dbm = voltage_to_dbm(v, z);
+        let v_back = dbm_to_voltage(dbm, z);
+        assert!((v_back - v).abs() < 1e-6);
     }
 }

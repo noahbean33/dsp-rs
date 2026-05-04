@@ -214,6 +214,108 @@ pub fn welch(signal: &[f64], segment_length: usize, overlap: usize, window: &[f6
     welch_psd
 }
 
+/// Compute the cross-power spectral density of two signals using Welch's method.
+///
+/// Returns the complex cross-spectrum `Pxy[k] = conj(X[k]) * Y[k]` averaged
+/// over overlapping windowed segments.
+#[must_use]
+pub fn cross_power_spectrum(
+    x: &[f64],
+    y: &[f64],
+    segment_length: usize,
+    overlap: usize,
+    window: &[f64],
+) -> Vec<Complex> {
+    let min_len = x.len().min(y.len());
+    if segment_length <= overlap || min_len < segment_length || window.len() != segment_length {
+        return Vec::new();
+    }
+    let step = segment_length - overlap;
+    let num_segments = (min_len - overlap) / step;
+    if num_segments == 0 {
+        return Vec::new();
+    }
+
+    let mut fft_size = 1;
+    while fft_size < segment_length {
+        fft_size <<= 1;
+    }
+
+    let window_energy: f64 = window.iter().map(|w| w * w).sum();
+    if window_energy.abs() < 1e-9 {
+        return Vec::new();
+    }
+
+    let mut cpsd = vec![Complex::zero(); fft_size];
+
+    for i in 0..num_segments {
+        let start = i * step;
+        let seg_x: Vec<f64> = x[start..start + segment_length]
+            .iter()
+            .zip(window.iter())
+            .map(|(&s, &w)| s * w)
+            .collect();
+        let seg_y: Vec<f64> = y[start..start + segment_length]
+            .iter()
+            .zip(window.iter())
+            .map(|(&s, &w)| s * w)
+            .collect();
+
+        let mut cx = fft::real_to_complex(&seg_x);
+        cx.resize(fft_size, Complex::zero());
+        fft::fft(&mut cx);
+
+        let mut cy = fft::real_to_complex(&seg_y);
+        cy.resize(fft_size, Complex::zero());
+        fft::fft(&mut cy);
+
+        for k in 0..fft_size {
+            let conj_x = Complex::new(cx[k].re, -cx[k].im);
+            cpsd[k] = cpsd[k] + conj_x * cy[k];
+        }
+    }
+
+    let scale = 1.0 / (num_segments as f64 * window_energy);
+    for v in &mut cpsd {
+        *v = Complex::new(v.re * scale, v.im * scale);
+    }
+    cpsd
+}
+
+/// Magnitude-squared coherence between two signals.
+///
+/// `C_xy[k] = |P_xy[k]|² / (P_xx[k] * P_yy[k])`
+///
+/// Values range from 0 (uncorrelated) to 1 (perfectly correlated).
+#[must_use]
+pub fn magnitude_squared_coherence(
+    x: &[f64],
+    y: &[f64],
+    segment_length: usize,
+    overlap: usize,
+    window: &[f64],
+) -> Vec<f64> {
+    let pxx = welch(x, segment_length, overlap, window);
+    let pyy = welch(y, segment_length, overlap, window);
+    let pxy = cross_power_spectrum(x, y, segment_length, overlap, window);
+
+    if pxx.is_empty() || pyy.is_empty() || pxy.is_empty() {
+        return Vec::new();
+    }
+
+    let n = pxx.len().min(pyy.len()).min(pxy.len());
+    (0..n)
+        .map(|k| {
+            let denom = pxx[k] * pyy[k];
+            if denom < 1e-30 {
+                0.0
+            } else {
+                pxy[k].norm_sqr() / denom
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +357,48 @@ mod tests {
         };
         // Just verify it returns a finite number
         assert!(aic1.is_finite());
+    }
+
+    #[test]
+    fn cross_power_spectrum_self_equals_psd() {
+        let n = 128;
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * 5.0 * i as f64 / n as f64).sin())
+            .collect();
+        let window: Vec<f64> = vec![1.0; 64];
+        let pxx = welch(&signal, 64, 32, &window);
+        let cpsd = cross_power_spectrum(&signal, &signal, 64, 32, &window);
+        // Cross-spectrum of signal with itself should have imaginary ≈ 0
+        // and real part ≈ PSD
+        assert!(!cpsd.is_empty());
+        for (k, c) in cpsd.iter().enumerate() {
+            assert!(c.im.abs() < 1e-6, "Imaginary part nonzero at bin {k}");
+            assert!((c.re - pxx[k]).abs() < 1e-6, "Real mismatch at bin {k}");
+        }
+    }
+
+    #[test]
+    fn coherence_self_is_one() {
+        let n = 256;
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * 10.0 * i as f64 / n as f64).sin())
+            .collect();
+        let window: Vec<f64> = vec![1.0; 64];
+        let coh = magnitude_squared_coherence(&signal, &signal, 64, 32, &window);
+        assert!(!coh.is_empty());
+        // Should be ~1 everywhere the PSD is nonzero
+        for &c in &coh {
+            if c > 1e-6 {
+                assert!((c - 1.0).abs() < 0.01, "Coherence not ~1: {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn cross_power_spectrum_empty_on_bad_params() {
+        let signal = vec![1.0; 10];
+        let window = vec![1.0; 64];
+        // Signal shorter than segment → empty
+        assert!(cross_power_spectrum(&signal, &signal, 64, 32, &window).is_empty());
     }
 }

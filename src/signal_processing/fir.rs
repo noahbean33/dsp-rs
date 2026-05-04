@@ -250,6 +250,209 @@ impl StreamingFir {
     }
 }
 
+// ─── Comb Filter ──────────────────────────────────────────────────────────────
+
+/// Feed-forward comb filter.
+///
+/// `y[n] = x[n] + α * x[n - delay]`
+///
+/// Creates a series of notches in the frequency response spaced at
+/// `Fs / delay` Hz.
+pub struct CombFilter {
+    buffer: Vec<f64>,
+    write_pos: usize,
+    delay: usize,
+    alpha: f64,
+}
+
+impl CombFilter {
+    /// Create a new feed-forward comb filter.
+    ///
+    /// * `delay` – delay in samples
+    /// * `alpha` – feedforward gain coefficient
+    #[must_use]
+    pub fn new(delay: usize, alpha: f64) -> Self {
+        let d = delay.max(1);
+        Self {
+            buffer: vec![0.0; d],
+            write_pos: 0,
+            delay: d,
+            alpha,
+        }
+    }
+
+    /// Process a single sample.
+    pub fn process_sample(&mut self, input: f64) -> f64 {
+        let delayed = self.buffer[self.write_pos];
+        self.buffer[self.write_pos] = input;
+        self.write_pos = (self.write_pos + 1) % self.delay;
+        input + self.alpha * delayed
+    }
+
+    /// Process an entire signal.
+    #[must_use]
+    pub fn apply(&mut self, signal: &[f64]) -> Vec<f64> {
+        signal.iter().map(|&x| self.process_sample(x)).collect()
+    }
+
+    /// Reset internal state.
+    pub fn reset(&mut self) {
+        self.buffer.fill(0.0);
+        self.write_pos = 0;
+    }
+}
+
+/// Feedback comb filter (IIR comb).
+///
+/// `y[n] = x[n] + α * y[n - delay]`
+pub struct FeedbackCombFilter {
+    buffer: Vec<f64>,
+    write_pos: usize,
+    delay: usize,
+    alpha: f64,
+}
+
+impl FeedbackCombFilter {
+    #[must_use]
+    pub fn new(delay: usize, alpha: f64) -> Self {
+        let d = delay.max(1);
+        Self {
+            buffer: vec![0.0; d],
+            write_pos: 0,
+            delay: d,
+            alpha,
+        }
+    }
+
+    pub fn process_sample(&mut self, input: f64) -> f64 {
+        let delayed = self.buffer[self.write_pos];
+        let output = input + self.alpha * delayed;
+        self.buffer[self.write_pos] = output;
+        self.write_pos = (self.write_pos + 1) % self.delay;
+        output
+    }
+
+    #[must_use]
+    pub fn apply(&mut self, signal: &[f64]) -> Vec<f64> {
+        signal.iter().map(|&x| self.process_sample(x)).collect()
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer.fill(0.0);
+        self.write_pos = 0;
+    }
+}
+
+// ─── Raised-Cosine / Root-Raised-Cosine Filters ──────────────────────────────
+
+/// Design a raised-cosine FIR pulse-shaping filter.
+///
+/// * `taps` – number of filter coefficients (must be odd)
+/// * `symbol_period` – symbol period in samples (Ts)
+/// * `alpha` – roll-off factor (0 ≤ α ≤ 1)
+#[must_use]
+pub fn design_raised_cosine(taps: usize, symbol_period: f64, alpha: f64) -> Vec<f64> {
+    if taps == 0 || symbol_period <= 0.0 {
+        return Vec::new();
+    }
+    let m = (taps - 1) as f64 / 2.0;
+    let mut coeffs = Vec::with_capacity(taps);
+    let mut energy = 0.0;
+
+    for n in 0..taps {
+        let t = (n as f64 - m) / symbol_period;
+        let h = if t.abs() < 1e-12 {
+            1.0
+        } else if alpha > 0.0 && (1.0 - (2.0 * alpha * t).powi(2)).abs() < 1e-12 {
+            alpha / 2.0 * (PI / (2.0 * alpha)).sin()
+        } else {
+            let sinc = (PI * t).sin() / (PI * t);
+            let cos_term = (PI * alpha * t).cos();
+            let denom = 1.0 - (2.0 * alpha * t).powi(2);
+            sinc * cos_term / denom
+        };
+        coeffs.push(h);
+        energy += h * h;
+    }
+
+    // Normalise energy
+    if energy > 1e-30 {
+        let scale = 1.0 / energy.sqrt();
+        for c in &mut coeffs {
+            *c *= scale;
+        }
+    }
+    coeffs
+}
+
+/// Design a root-raised-cosine FIR pulse-shaping filter.
+///
+/// * `taps` – number of filter coefficients (must be odd)
+/// * `symbol_period` – symbol period in samples (Ts)
+/// * `alpha` – roll-off factor (0 ≤ α ≤ 1)
+#[must_use]
+pub fn design_root_raised_cosine(taps: usize, symbol_period: f64, alpha: f64) -> Vec<f64> {
+    if taps == 0 || symbol_period <= 0.0 {
+        return Vec::new();
+    }
+    let m = (taps - 1) as f64 / 2.0;
+    let mut coeffs = Vec::with_capacity(taps);
+    let mut energy = 0.0;
+
+    for n in 0..taps {
+        let t = (n as f64 - m) / symbol_period;
+        let h = if t.abs() < 1e-12 {
+            1.0 - alpha + 4.0 * alpha / PI
+        } else if alpha > 0.0 && (1.0 - (4.0 * alpha * t).powi(2)).abs() < 1e-12 {
+            alpha / (2.0_f64.sqrt())
+                * ((1.0 + 2.0 / PI) * (PI / (4.0 * alpha)).sin()
+                    + (1.0 - 2.0 / PI) * (PI / (4.0 * alpha)).cos())
+        } else {
+            let num = (PI * t * (1.0 - alpha)).sin()
+                + 4.0 * alpha * t * (PI * t * (1.0 + alpha)).cos();
+            let denom = PI * t * (1.0 - (4.0 * alpha * t).powi(2));
+            num / denom
+        };
+        coeffs.push(h);
+        energy += h * h;
+    }
+
+    if energy > 1e-30 {
+        let scale = 1.0 / energy.sqrt();
+        for c in &mut coeffs {
+            *c *= scale;
+        }
+    }
+    coeffs
+}
+
+/// Design a Gaussian FIR filter.
+///
+/// * `taps` – number of filter coefficients
+/// * `bt` – bandwidth-symbol time product (BT)
+#[must_use]
+pub fn design_gaussian(taps: usize, bt: f64) -> Vec<f64> {
+    if taps == 0 || bt <= 0.0 {
+        return Vec::new();
+    }
+    let m = (taps - 1) as f64 / 2.0;
+    let sigma = (2.0 * PI * bt).recip() * (2.0_f64.ln()).sqrt();
+    let mut coeffs = Vec::with_capacity(taps);
+    let mut sum = 0.0;
+    for n in 0..taps {
+        let t = n as f64 - m;
+        let h = (-0.5 * (t / sigma).powi(2)).exp();
+        coeffs.push(h);
+        sum += h;
+    }
+    if sum.abs() > 1e-30 {
+        for c in &mut coeffs {
+            *c /= sum;
+        }
+    }
+    coeffs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +539,57 @@ mod tests {
     fn bandpass_invalid_cutoffs_empty() {
         let coeffs = design_bandpass(51, 0.3, 0.1);
         assert!(coeffs.is_empty());
+    }
+
+    #[test]
+    fn comb_filter_impulse_response() {
+        let mut comb = CombFilter::new(3, 1.0);
+        // Impulse: should appear at n=0 and echoed at n=3
+        let out = comb.apply(&[1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!((out[0] - 1.0).abs() < 1e-10);
+        assert!((out[1] - 0.0).abs() < 1e-10);
+        assert!((out[2] - 0.0).abs() < 1e-10);
+        assert!((out[3] - 1.0).abs() < 1e-10); // delayed copy
+        assert!((out[4] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn feedback_comb_filter_grows() {
+        let mut comb = FeedbackCombFilter::new(2, 0.5);
+        let out = comb.apply(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!((out[0] - 1.0).abs() < 1e-10);
+        assert!((out[2] - 0.5).abs() < 1e-10);  // feedback of out[0]
+        assert!((out[4] - 0.25).abs() < 1e-10); // feedback of out[2]
+    }
+
+    #[test]
+    fn raised_cosine_correct_length() {
+        let coeffs = design_raised_cosine(65, 8.0, 0.35);
+        assert_eq!(coeffs.len(), 65);
+        // Should have finite values
+        assert!(coeffs.iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn root_raised_cosine_correct_length() {
+        let coeffs = design_root_raised_cosine(65, 8.0, 0.35);
+        assert_eq!(coeffs.len(), 65);
+        assert!(coeffs.iter().all(|c| c.is_finite()));
+    }
+
+    #[test]
+    fn gaussian_filter_sums_to_one() {
+        let coeffs = design_gaussian(31, 0.3);
+        assert_eq!(coeffs.len(), 31);
+        let sum: f64 = coeffs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gaussian_filter_symmetric() {
+        let coeffs = design_gaussian(31, 0.3);
+        for i in 0..coeffs.len() / 2 {
+            assert!((coeffs[i] - coeffs[coeffs.len() - 1 - i]).abs() < 1e-10);
+        }
     }
 }

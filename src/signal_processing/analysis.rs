@@ -227,6 +227,202 @@ pub fn dc_remove(signal: &[f64], cutoff_hz: f64, sample_rate: f64) -> Vec<f64> {
     output
 }
 
+// ─── Envelope Detection ───────────────────────────────────────────────────────
+
+/// Envelope follower with configurable attack and decay coefficients.
+///
+/// Tracks the amplitude envelope of a signal using a one-pole filter:
+/// - When `|x[n]| > env[n-1]`: `env[n] = attack * |x[n]| + (1 - attack) * env[n-1]`
+/// - Otherwise:                 `env[n] = decay  * |x[n]| + (1 - decay)  * env[n-1]`
+///
+/// `attack` and `decay` are in the range `(0, 1]`. Larger values track faster.
+#[must_use]
+pub fn envelope(signal: &[f64], attack: f64, decay: f64) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let mut env = Vec::with_capacity(signal.len());
+    let mut state = 0.0_f64;
+    for &x in signal {
+        let abs_x = x.abs();
+        if abs_x > state {
+            state = attack * abs_x + (1.0 - attack) * state;
+        } else {
+            state = decay * abs_x + (1.0 - decay) * state;
+        }
+        env.push(state);
+    }
+    env
+}
+
+/// RMS envelope follower.
+///
+/// Computes a smoothed RMS envelope using a one-pole filter on `x²`:
+/// `rms²[n] = α * x[n]² + (1 - α) * rms²[n-1]`,  output = √(rms²[n]).
+///
+/// `alpha` controls the smoothing (higher = faster tracking).
+#[must_use]
+pub fn envelope_rms(signal: &[f64], alpha: f64) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let mut env = Vec::with_capacity(signal.len());
+    let mut state = 0.0_f64;
+    for &x in signal {
+        state = alpha * x * x + (1.0 - alpha) * state;
+        env.push(state.sqrt());
+    }
+    env
+}
+
+/// Hilbert envelope (analytic signal magnitude).
+///
+/// Computes the instantaneous amplitude envelope by:
+/// 1. Taking the FFT of the signal.
+/// 2. Zeroing the negative-frequency components (creating the analytic signal).
+/// 3. Taking the inverse FFT.
+/// 4. Returning the magnitude of the complex analytic signal.
+///
+/// The signal is zero-padded to the next power of 2.
+#[must_use]
+pub fn envelope_hilbert(signal: &[f64]) -> Vec<f64> {
+    use super::fft::{Complex, fft, ifft, real_to_complex, zero_pad_to_power_of_2};
+
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let orig_len = signal.len();
+    let mut data = zero_pad_to_power_of_2(&real_to_complex(signal));
+    let n = data.len();
+    fft(&mut data);
+
+    // Build analytic signal: keep DC and Nyquist, double positive freqs, zero negative
+    // Bin 0 (DC) stays, bins 1..N/2-1 doubled, bin N/2 stays, bins N/2+1..N-1 zeroed
+    if n > 1 {
+        for i in 1..n / 2 {
+            data[i] = data[i] * 2.0;
+        }
+        for i in (n / 2 + 1)..n {
+            data[i] = Complex::zero();
+        }
+    }
+
+    ifft(&mut data);
+
+    data[..orig_len].iter().map(|c| c.norm()).collect()
+}
+
+// ─── Signal Integration ───────────────────────────────────────────────────────
+
+/// Numerical integration (cumulative trapezoidal rule).
+///
+/// `interval` is the sampling interval Δt.
+/// `y[n] = y[n-1] + Δt * (x[n] + x[n-1]) / 2`
+#[must_use]
+pub fn integrate(signal: &[f64], interval: f64) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let mut output = Vec::with_capacity(signal.len());
+    output.push(0.0);
+    for i in 1..signal.len() {
+        let prev = output[i - 1];
+        output.push(prev + interval * (signal[i] + signal[i - 1]) / 2.0);
+    }
+    output
+}
+
+// ─── Threshold / Clamp / Limit ────────────────────────────────────────────────
+
+/// Threshold mode for signal processing utilities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThresholdMode {
+    /// Zero values below the threshold.
+    AboveZero,
+    /// Zero values above the threshold.
+    BelowZero,
+    /// Replace values below the threshold with the threshold.
+    AboveClamp,
+    /// Replace values above the threshold with the threshold.
+    BelowClamp,
+}
+
+/// Apply a threshold to a signal.
+///
+/// Depending on the mode, values that do not meet the threshold condition
+/// are either zeroed out or clamped.
+#[must_use]
+pub fn threshold(signal: &[f64], thresh: f64, mode: ThresholdMode) -> Vec<f64> {
+    signal
+        .iter()
+        .map(|&x| match mode {
+            ThresholdMode::AboveZero => {
+                if x >= thresh { x } else { 0.0 }
+            }
+            ThresholdMode::BelowZero => {
+                if x <= thresh { x } else { 0.0 }
+            }
+            ThresholdMode::AboveClamp => {
+                if x >= thresh { x } else { thresh }
+            }
+            ThresholdMode::BelowClamp => {
+                if x <= thresh { x } else { thresh }
+            }
+        })
+        .collect()
+}
+
+/// Soft threshold: shrink values towards zero.
+///
+/// `y = sign(x) * max(|x| - thresh, 0)`
+#[must_use]
+pub fn soft_threshold(signal: &[f64], thresh: f64) -> Vec<f64> {
+    signal
+        .iter()
+        .map(|&x| {
+            let abs = x.abs();
+            if abs > thresh {
+                x.signum() * (abs - thresh)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Clamp (limit) signal values to `[min_val, max_val]`.
+#[must_use]
+pub fn clamp(signal: &[f64], min_val: f64, max_val: f64) -> Vec<f64> {
+    signal
+        .iter()
+        .map(|&x| x.max(min_val).min(max_val))
+        .collect()
+}
+
+/// Count how many values exceed the threshold.
+#[must_use]
+pub fn count_over_threshold(signal: &[f64], thresh: f64) -> usize {
+    signal.iter().filter(|&&x| x > thresh).count()
+}
+
+/// Count how many absolute values exceed the threshold.
+#[must_use]
+pub fn count_abs_over_threshold(signal: &[f64], thresh: f64) -> usize {
+    signal.iter().filter(|&&x| x.abs() > thresh).count()
+}
+
+/// Element-wise maximum of two signals.
+#[must_use]
+pub fn select_max(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x.max(y)).collect()
+}
+
+/// Element-wise minimum of two signals.
+#[must_use]
+pub fn select_min(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x.min(y)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +518,116 @@ mod tests {
     fn dc_remove_empty_passthrough() {
         let empty: Vec<f64> = Vec::new();
         assert!(dc_remove(&empty, 10.0, 1000.0).is_empty());
+    }
+
+    #[test]
+    fn envelope_tracks_amplitude() {
+        let pi = std::f64::consts::PI;
+        // AM signal: carrier modulated by a slow envelope
+        let signal: Vec<f64> = (0..1000)
+            .map(|i| {
+                let t = i as f64 / 1000.0;
+                let carrier = (2.0 * pi * 100.0 * t).sin();
+                let mod_env = 0.5 + 0.5 * (2.0 * pi * 5.0 * t).sin();
+                carrier * mod_env
+            })
+            .collect();
+        let env = envelope(&signal, 0.1, 0.01);
+        assert_eq!(env.len(), signal.len());
+        // Envelope should be non-negative
+        assert!(env.iter().all(|&v| v >= -1e-10));
+    }
+
+    #[test]
+    fn envelope_rms_positive() {
+        let pi = std::f64::consts::PI;
+        let signal: Vec<f64> = (0..200)
+            .map(|i| (2.0 * pi * 50.0 * i as f64 / 1000.0).sin())
+            .collect();
+        let env = envelope_rms(&signal, 0.05);
+        assert_eq!(env.len(), signal.len());
+        assert!(env.iter().all(|&v| v >= 0.0));
+        // RMS should settle near 1/√2 ≈ 0.707 for a unit sine
+        let tail_mean: f64 = env[100..].iter().sum::<f64>() / env[100..].len() as f64;
+        assert!((tail_mean - 0.707).abs() < 0.2);
+    }
+
+    #[test]
+    fn envelope_hilbert_of_sine() {
+        let pi = std::f64::consts::PI;
+        let n = 256;
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * pi * 10.0 * i as f64 / n as f64).sin())
+            .collect();
+        let env = envelope_hilbert(&signal);
+        assert_eq!(env.len(), n);
+        // Hilbert envelope of a pure sine should be ~constant (~1.0)
+        // Check the middle portion (edges have transient effects)
+        let mid = &env[n / 4..3 * n / 4];
+        let mean: f64 = mid.iter().sum::<f64>() / mid.len() as f64;
+        assert!((mean - 1.0).abs() < 0.15);
+    }
+
+    #[test]
+    fn integrate_constant() {
+        // Integral of constant 2.0 with dt=0.1 over 10 samples
+        let signal = vec![2.0; 10];
+        let result = integrate(&signal, 0.1);
+        assert_eq!(result.len(), 10);
+        assert!((result[0] - 0.0).abs() < 1e-10);
+        // After 9 intervals: 9 * 0.1 * 2.0 = 1.8
+        assert!((result[9] - 1.8).abs() < 1e-10);
+    }
+
+    #[test]
+    fn integrate_empty() {
+        assert!(integrate(&[], 1.0).is_empty());
+    }
+
+    #[test]
+    fn threshold_above_zero() {
+        let signal = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let out = threshold(&signal, 1.0, ThresholdMode::AboveZero);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn threshold_below_clamp() {
+        let signal = vec![-2.0, 0.0, 5.0, 10.0];
+        let out = threshold(&signal, 5.0, ThresholdMode::BelowClamp);
+        assert_eq!(out, vec![-2.0, 0.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn soft_threshold_shrinks() {
+        let signal = vec![-3.0, -1.0, 0.0, 1.0, 3.0];
+        let out = soft_threshold(&signal, 2.0);
+        assert!((out[0] - (-1.0)).abs() < 1e-10);
+        assert!((out[1] - 0.0).abs() < 1e-10);
+        assert!((out[2] - 0.0).abs() < 1e-10);
+        assert!((out[3] - 0.0).abs() < 1e-10);
+        assert!((out[4] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn clamp_limits_values() {
+        let signal = vec![-5.0, -1.0, 0.0, 1.0, 5.0];
+        let out = clamp(&signal, -2.0, 2.0);
+        assert_eq!(out, vec![-2.0, -1.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn count_over_threshold_works() {
+        let signal = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(count_over_threshold(&signal, 3.0), 2);
+        assert_eq!(count_abs_over_threshold(&signal, 3.0), 2);
+    }
+
+    #[test]
+    fn select_max_min() {
+        let a = vec![1.0, 5.0, 3.0];
+        let b = vec![4.0, 2.0, 6.0];
+        assert_eq!(select_max(&a, &b), vec![4.0, 5.0, 6.0]);
+        assert_eq!(select_min(&a, &b), vec![1.0, 2.0, 3.0]);
     }
 }
