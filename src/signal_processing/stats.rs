@@ -550,6 +550,683 @@ pub fn permutation_significance(observed: f64, null_distribution: &[f64]) -> Per
     }
 }
 
+// ─── Median & Rank ────────────────────────────────────────────────────────────
+
+/// Compute the median of a signal.
+///
+/// For even-length signals, returns the average of the two middle values.
+#[must_use]
+pub fn median(signal: &[f64]) -> f64 {
+    if signal.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = signal.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+/// Rank-transform a signal (average ranks for ties).
+///
+/// Assigns fractional ranks 1..N to each element, with ties receiving the
+/// average of the ranks they would span.
+#[must_use]
+pub fn rank_transform(signal: &[f64]) -> Vec<f64> {
+    let n = signal.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Create (value, original_index) pairs and sort by value
+    let mut indexed: Vec<(f64, usize)> = signal.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+    indexed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut ranks = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        // Find the end of this group of ties
+        let mut j = i + 1;
+        while j < n && (indexed[j].0 - indexed[i].0).abs() < 1e-15 {
+            j += 1;
+        }
+        // Average rank for this group (1-indexed)
+        let avg_rank = (i + 1 + j) as f64 / 2.0;
+        for item in indexed.iter().take(j).skip(i) {
+            ranks[item.1] = avg_rank;
+        }
+        i = j;
+    }
+    ranks
+}
+
+// ─── MAD & Modified Z-score ──────────────────────────────────────────────────
+
+/// Median Absolute Deviation (MAD).
+///
+/// `MAD = median(|x - median(x)|)`
+///
+/// A robust measure of dispersion, resistant to outliers.
+#[must_use]
+pub fn mad(signal: &[f64]) -> f64 {
+    if signal.is_empty() {
+        return 0.0;
+    }
+    let med = median(signal);
+    let deviations: Vec<f64> = signal.iter().map(|&x| (x - med).abs()).collect();
+    median(&deviations)
+}
+
+/// Modified Z-score using MAD instead of standard deviation.
+///
+/// `Mz = 0.6745 * (x - median(x)) / MAD`
+///
+/// The constant 0.6745 is `Φ⁻¹(3/4)`, making the MAD consistent with
+/// standard deviation for normally distributed data.
+///
+/// Useful for outlier detection in non-normal distributions.
+#[must_use]
+pub fn modified_z_score(signal: &[f64]) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let med = median(signal);
+    let mad_val = mad(signal);
+    if mad_val < 1e-30 {
+        return vec![0.0; signal.len()];
+    }
+    // 0.6745 ≈ inverse normal CDF at 0.75
+    let k = 0.674_489_750_196_082;
+    signal.iter().map(|&x| k * (x - med) / mad_val).collect()
+}
+
+// ─── Z-score & Normalizations ─────────────────────────────────────────────────
+
+/// Z-score normalization (standardization).
+///
+/// `z = (x - mean) / std`
+///
+/// Transforms data to zero mean and unit variance.
+///
+/// * `ddof` – delta degrees of freedom for std (0 = population, 1 = sample)
+#[must_use]
+pub fn z_score(signal: &[f64], ddof: usize) -> Vec<f64> {
+    if signal.len() < 2 {
+        return vec![0.0; signal.len()];
+    }
+    let m = mean(signal);
+    let n = signal.len();
+    let denom = if ddof == 0 { n } else { n - ddof.min(n - 1) };
+    let var = signal.iter().map(|&x| (x - m) * (x - m)).sum::<f64>() / denom as f64;
+    let s = var.sqrt();
+    if s < 1e-30 {
+        return vec![0.0; signal.len()];
+    }
+    signal.iter().map(|&x| (x - m) / s).collect()
+}
+
+/// Min-max scaling to an arbitrary range `[new_min, new_max]`.
+///
+/// `x_scaled = (x - min) / (max - min) * (new_max - new_min) + new_min`
+#[must_use]
+pub fn min_max_scale(signal: &[f64], new_min: f64, new_max: f64) -> Vec<f64> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+    let min_v = min(signal);
+    let max_v = max(signal);
+    let range = max_v - min_v;
+    if range < 1e-30 {
+        return vec![(new_min + new_max) / 2.0; signal.len()];
+    }
+    let new_range = new_max - new_min;
+    signal.iter().map(|&x| (x - min_v) / range * new_range + new_min).collect()
+}
+
+/// Fisher-Z transform: `F(r) = arctanh(r)`.
+///
+/// Transforms correlation coefficients to approximately normally distributed
+/// values, enabling standard statistical tests on correlations.
+///
+/// Input values should be in (-1, 1).
+#[must_use]
+pub fn fisher_z(r: f64) -> f64 {
+    r.atanh()
+}
+
+/// Inverse Fisher-Z transform: `r = tanh(z)`.
+#[must_use]
+pub fn fisher_z_inv(z: f64) -> f64 {
+    z.tanh()
+}
+
+/// Apply Fisher-Z transform to a vector of correlation coefficients.
+#[must_use]
+pub fn fisher_z_vec(correlations: &[f64]) -> Vec<f64> {
+    correlations.iter().map(|&r| r.atanh()).collect()
+}
+
+// ─── Entropy ──────────────────────────────────────────────────────────────────
+
+/// Shannon entropy of a discrete probability distribution.
+///
+/// `H = -Σ p * log2(p)`
+///
+/// * `probabilities` – probability values (should sum to ~1)
+///
+/// Returns entropy in bits. Zero-probability entries are skipped.
+#[must_use]
+pub fn shannon_entropy(probabilities: &[f64]) -> f64 {
+    let mut h = 0.0;
+    for &p in probabilities {
+        if p > 1e-30 {
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
+/// Compute Shannon entropy of a signal by binning into a histogram.
+///
+/// * `signal` – input data
+/// * `num_bins` – number of histogram bins
+///
+/// Returns entropy in bits.
+#[must_use]
+pub fn signal_entropy(signal: &[f64], num_bins: usize) -> f64 {
+    if signal.is_empty() || num_bins == 0 {
+        return 0.0;
+    }
+    let min_v = min(signal);
+    let max_v = max(signal);
+    if (max_v - min_v) < 1e-30 {
+        return 0.0;
+    }
+    let hist = histogram(signal, min_v, max_v, num_bins);
+    let n = signal.len() as f64;
+    let probs: Vec<f64> = hist.iter().map(|&c| c / n).collect();
+    shannon_entropy(&probs)
+}
+
+// ─── Correlation Functions ────────────────────────────────────────────────────
+
+/// Pearson correlation coefficient between two signals.
+///
+/// `r = Σ((x-μx)(y-μy)) / sqrt(Σ(x-μx)² * Σ(y-μy)²)`
+///
+/// Returns a value in [-1, 1]. Returns 0 if either signal has zero variance.
+#[must_use]
+pub fn pearson_correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let mx = x[..n].iter().sum::<f64>() / n as f64;
+    let my = y[..n].iter().sum::<f64>() / n as f64;
+
+    let mut num = 0.0;
+    let mut dx2 = 0.0;
+    let mut dy2 = 0.0;
+    for i in 0..n {
+        let dx = x[i] - mx;
+        let dy = y[i] - my;
+        num += dx * dy;
+        dx2 += dx * dx;
+        dy2 += dy * dy;
+    }
+
+    let denom = (dx2 * dy2).sqrt();
+    if denom < 1e-30 {
+        return 0.0;
+    }
+    num / denom
+}
+
+/// Spearman rank correlation coefficient.
+///
+/// Computes the Pearson correlation of the rank-transformed data.
+/// Measures monotonic (not necessarily linear) relationships.
+#[must_use]
+pub fn spearman_correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let rx = rank_transform(&x[..n]);
+    let ry = rank_transform(&y[..n]);
+    pearson_correlation(&rx, &ry)
+}
+
+/// Kendall tau-b correlation coefficient.
+///
+/// Measures ordinal association: the difference between the probability
+/// of concordant and discordant pairs.
+#[must_use]
+pub fn kendall_correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+
+    let mut concordant: i64 = 0;
+    let mut discordant: i64 = 0;
+    let mut ties_x: i64 = 0;
+    let mut ties_y: i64 = 0;
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = x[i] - x[j];
+            let dy = y[i] - y[j];
+            let product = dx * dy;
+
+            if product.abs() < 1e-15 {
+                // At least one tie
+                if dx.abs() < 1e-15 && dy.abs() < 1e-15 {
+                    // Tie in both
+                    ties_x += 1;
+                    ties_y += 1;
+                } else if dx.abs() < 1e-15 {
+                    ties_x += 1;
+                } else {
+                    ties_y += 1;
+                }
+            } else if product > 0.0 {
+                concordant += 1;
+            } else {
+                discordant += 1;
+            }
+        }
+    }
+
+    let n0 = (n * (n - 1)) as f64 / 2.0;
+    let denom = ((n0 - ties_x as f64) * (n0 - ties_y as f64)).sqrt();
+    if denom < 1e-30 {
+        return 0.0;
+    }
+    (concordant - discordant) as f64 / denom
+}
+
+/// Cosine similarity between two vectors.
+///
+/// `cos_sim = (x · y) / (||x|| * ||y||)`
+///
+/// Unlike correlation, cosine similarity is sensitive to the mean/offset.
+/// Returns a value in [-1, 1].
+#[must_use]
+pub fn cosine_similarity(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut nx = 0.0;
+    let mut ny = 0.0;
+    for i in 0..n {
+        dot += x[i] * y[i];
+        nx += x[i] * x[i];
+        ny += y[i] * y[i];
+    }
+    let denom = (nx * ny).sqrt();
+    if denom < 1e-30 {
+        return 0.0;
+    }
+    dot / denom
+}
+
+/// Compute a correlation matrix for multi-channel data.
+///
+/// * `data` – flat row-major (channels × samples)
+/// * `channels` – number of channels/features
+/// * `samples` – number of observations
+///
+/// Returns flat row-major (channels × channels) Pearson correlation matrix.
+#[must_use]
+pub fn correlation_matrix(data: &[f64], channels: usize, samples: usize) -> Vec<f64> {
+    assert_eq!(data.len(), channels * samples);
+    let mut corr = vec![0.0; channels * channels];
+    for i in 0..channels {
+        corr[i * channels + i] = 1.0;
+        for j in (i + 1)..channels {
+            let r = pearson_correlation(
+                &data[i * samples..(i + 1) * samples],
+                &data[j * samples..(j + 1) * samples],
+            );
+            corr[i * channels + j] = r;
+            corr[j * channels + i] = r;
+        }
+    }
+    corr
+}
+
+// ─── Signal Detection Theory ─────────────────────────────────────────────────
+
+/// Compute d-prime (d') for signal detection theory.
+///
+/// `d' = Z(hit_rate) - Z(false_alarm_rate)`
+///
+/// where Z is the inverse normal CDF (probit function).
+///
+/// * `hit_rate` – proportion of hits (0 < hr < 1)
+/// * `false_alarm_rate` – proportion of false alarms (0 < far < 1)
+///
+/// Rates of exactly 0 or 1 are clamped to 0.001 and 0.999.
+#[must_use]
+pub fn d_prime(hit_rate: f64, false_alarm_rate: f64) -> f64 {
+    let hr = hit_rate.clamp(0.001, 0.999);
+    let far = false_alarm_rate.clamp(0.001, 0.999);
+    probit(hr) - probit(far)
+}
+
+/// Probit function (inverse normal CDF) using rational approximation.
+///
+/// Abramowitz & Stegun approximation for the inverse of the standard
+/// normal cumulative distribution function.
+fn probit(p: f64) -> f64 {
+    // Ensure p is in valid range
+    let p = p.clamp(1e-10, 1.0 - 1e-10);
+
+    // Use symmetry: if p > 0.5, compute for 1-p and negate
+    if p < 0.5 {
+        -rational_approx((-2.0 * p.ln()).sqrt())
+    } else {
+        rational_approx((-2.0 * (1.0 - p).ln()).sqrt())
+    }
+}
+
+/// Rational approximation helper for probit.
+fn rational_approx(t: f64) -> f64 {
+    // Coefficients from Peter Acklam's approximation
+    let c0 = 2.515_517;
+    let c1 = 0.802_853;
+    let c2 = 0.010_328;
+    let d1 = 1.432_788;
+    let d2 = 0.189_269;
+    let d3 = 0.001_308;
+
+    t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t)
+}
+
+// ─── Bootstrap Confidence Intervals ──────────────────────────────────────────
+
+/// Result of a bootstrap confidence interval computation.
+#[derive(Clone, Debug)]
+pub struct BootstrapCIResult {
+    /// Sample statistic (e.g., mean of the original data).
+    pub statistic: f64,
+    /// Lower bound of the confidence interval.
+    pub ci_lower: f64,
+    /// Upper bound of the confidence interval.
+    pub ci_upper: f64,
+    /// Bootstrap distribution of the statistic.
+    pub bootstrap_distribution: Vec<f64>,
+}
+
+/// Bootstrap confidence interval for the mean.
+///
+/// Resamples the data with replacement `n_bootstrap` times, computes the mean
+/// of each resample, and finds the percentile-based confidence interval.
+///
+/// * `data` – input data
+/// * `confidence` – confidence level (e.g., 95.0 for 95%)
+/// * `n_bootstrap` – number of bootstrap resamples
+/// * `seed` – random seed
+#[must_use]
+pub fn bootstrap_ci_mean(
+    data: &[f64],
+    confidence: f64,
+    n_bootstrap: usize,
+    seed: u64,
+) -> BootstrapCIResult {
+    let n = data.len();
+    if n == 0 {
+        return BootstrapCIResult {
+            statistic: 0.0,
+            ci_lower: 0.0,
+            ci_upper: 0.0,
+            bootstrap_distribution: Vec::new(),
+        };
+    }
+
+    let statistic = mean(data);
+
+    // LCG RNG
+    let mut rng_state = seed;
+    let mut next_rand = || -> u64 {
+        rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        rng_state
+    };
+
+    let mut boot_means = Vec::with_capacity(n_bootstrap);
+    for _ in 0..n_bootstrap {
+        let mut sum = 0.0;
+        for _ in 0..n {
+            let idx = (next_rand() as usize) % n;
+            sum += data[idx];
+        }
+        boot_means.push(sum / n as f64);
+    }
+
+    // Sort for percentile computation
+    boot_means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let alpha = (100.0 - confidence) / 200.0;
+    let lower_idx = (alpha * n_bootstrap as f64).floor() as usize;
+    let upper_idx = ((1.0 - alpha) * n_bootstrap as f64).ceil() as usize;
+
+    let ci_lower = boot_means[lower_idx.min(n_bootstrap - 1)];
+    let ci_upper = boot_means[upper_idx.min(n_bootstrap - 1)];
+
+    BootstrapCIResult {
+        statistic,
+        ci_lower,
+        ci_upper,
+        bootstrap_distribution: boot_means,
+    }
+}
+
+// ─── T-tests ──────────────────────────────────────────────────────────────────
+
+/// Result of a t-test.
+#[derive(Clone, Debug)]
+pub struct TTestResult {
+    /// The t-statistic.
+    pub t_statistic: f64,
+    /// Degrees of freedom.
+    pub df: f64,
+    /// Two-tailed p-value (approximate).
+    pub p_value: f64,
+}
+
+/// One-sample t-test: test whether the mean of a sample differs from a value.
+///
+/// * `data` – sample data
+/// * `population_mean` – hypothesized population mean (often 0)
+#[must_use]
+pub fn t_test_one_sample(data: &[f64], population_mean: f64) -> TTestResult {
+    let n = data.len();
+    if n < 2 {
+        return TTestResult { t_statistic: 0.0, df: 0.0, p_value: 1.0 };
+    }
+    let m = mean(data);
+    let s = sample_std_dev(data);
+    let se = s / (n as f64).sqrt();
+    let t = if se > 1e-30 { (m - population_mean) / se } else { 0.0 };
+    let df = (n - 1) as f64;
+    let p = t_to_p(t.abs(), df);
+
+    TTestResult { t_statistic: t, df, p_value: p }
+}
+
+/// Independent two-sample t-test (Welch's t-test, unequal variances).
+///
+/// Tests whether the means of two independent samples differ.
+#[must_use]
+pub fn t_test_two_sample(group_a: &[f64], group_b: &[f64]) -> TTestResult {
+    let na = group_a.len();
+    let nb = group_b.len();
+    if na < 2 || nb < 2 {
+        return TTestResult { t_statistic: 0.0, df: 0.0, p_value: 1.0 };
+    }
+
+    let ma = mean(group_a);
+    let mb = mean(group_b);
+    let va = sample_variance(group_a);
+    let vb = sample_variance(group_b);
+
+    let se = (va / na as f64 + vb / nb as f64).sqrt();
+    let t = if se > 1e-30 { (ma - mb) / se } else { 0.0 };
+
+    // Welch-Satterthwaite degrees of freedom
+    let num = (va / na as f64 + vb / nb as f64).powi(2);
+    let den = (va / na as f64).powi(2) / (na - 1) as f64
+        + (vb / nb as f64).powi(2) / (nb - 1) as f64;
+    let df = if den > 1e-30 { num / den } else { 1.0 };
+    let p = t_to_p(t.abs(), df);
+
+    TTestResult { t_statistic: t, df, p_value: p }
+}
+
+/// Approximate two-tailed p-value from t-statistic using a normal approximation
+/// for large df, or a simple beta incomplete function approximation.
+fn t_to_p(t_abs: f64, df: f64) -> f64 {
+    // For large df, t → z, use normal CDF approximation
+    // Use the approximation: p ≈ 2 * (1 - Φ(|t| * sqrt(df/(df-2+t²)))) for rough estimate
+    // More accurate: use regularized incomplete beta function
+    let x = df / (df + t_abs * t_abs);
+    // Approximate regularized incomplete beta I_x(df/2, 1/2) using series
+    let p = regularized_incomplete_beta(x, df / 2.0, 0.5);
+    p.clamp(0.0, 1.0)
+}
+
+/// Simple approximation of the regularized incomplete beta function I_x(a, b).
+/// Used internally for p-value computation from t-statistics.
+fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+
+    // Use continued fraction (Lentz's algorithm) for better accuracy
+    let mut f = 1.0;
+    let mut c = 1.0;
+    let mut d;
+
+    let max_iter = 200;
+    let eps = 1e-10;
+
+    // First, compute ln(B(a,b)) using Stirling for the prefactor
+    let log_prefix = a * x.ln() + b * (1.0 - x).ln()
+        - (a.ln() + ln_beta(a, b));
+
+    let prefix = log_prefix.exp();
+
+    // Continued fraction for I_x(a, b) = prefix * 1/(1+ d1/(1+ d2/(1+ ...)))
+    d = 1.0;
+    for m in 0..max_iter {
+        let m_f = m as f64;
+        // Compute numerator coefficient
+        let numerator = if m == 0 {
+            1.0
+        } else if m % 2 == 0 {
+            let k = m_f / 2.0;
+            k * (b - k) * x / ((a + 2.0 * k - 1.0) * (a + 2.0 * k))
+        } else {
+            let k = (m_f - 1.0) / 2.0;
+            -(a + k) * (a + b + k) * x / ((a + 2.0 * k) * (a + 2.0 * k + 1.0))
+        };
+
+        d = 1.0 + numerator * d;
+        if d.abs() < 1e-30 {
+            d = 1e-30;
+        }
+        d = 1.0 / d;
+
+        c = 1.0 + numerator / c;
+        if c.abs() < 1e-30 {
+            c = 1e-30;
+        }
+
+        let delta = c * d;
+        f *= delta;
+
+        if (delta - 1.0).abs() < eps {
+            break;
+        }
+    }
+
+    (prefix * f / a).clamp(0.0, 1.0)
+}
+
+/// Natural log of the Beta function using log-gamma (Stirling approximation).
+fn ln_beta(a: f64, b: f64) -> f64 {
+    ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b)
+}
+
+/// Stirling approximation for ln(Γ(x)).
+fn ln_gamma(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    // Lanczos approximation coefficients
+    let g = 7.0;
+    let coef = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+
+    let x = x - 1.0;
+    let mut sum = coef[0];
+    for (i, &c) in coef.iter().enumerate().skip(1) {
+        sum += c / (x + i as f64);
+    }
+
+    let t = x + g + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+}
+
+// ─── Dispersion Measures ──────────────────────────────────────────────────────
+
+/// Coefficient of Variation (CV).
+///
+/// `CV = std / mean`
+///
+/// A normalized measure of dispersion. Meaningful only for positive-valued data.
+#[must_use]
+pub fn coefficient_of_variation(signal: &[f64]) -> f64 {
+    let m = mean(signal);
+    if m.abs() < 1e-30 {
+        return 0.0;
+    }
+    std_dev(signal) / m.abs()
+}
+
+/// Fano factor.
+///
+/// `F = variance / mean`
+///
+/// A measure of dispersion relative to a Poisson process (F=1 for Poisson).
+/// Meaningful only for positive-valued (count) data.
+#[must_use]
+pub fn fano_factor(signal: &[f64]) -> f64 {
+    let m = mean(signal);
+    if m.abs() < 1e-30 {
+        return 0.0;
+    }
+    variance(signal) / m.abs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

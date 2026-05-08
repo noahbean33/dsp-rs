@@ -1,0 +1,24 @@
+**Embedded-viable, high value on RISC-V:**
+`fft`, `fir`, `iir`, `convolution`, `windowing`, `agc`, `pll`, `resampling`, `quantization`, `generators`, `modulation`, `delay`, `fdfilter`, `weighting` — this is the core that actually runs on hardware with constrained memory and no OS. PLL and AGC in particular are things embedded devs constantly reimplement.
+
+**Embedded-viable, niche but real:**
+`dtmf`, `spectral`, `stft`, `stats`, `analysis`, `robust`, `adaptive` — useful for more capable targets (ESP32-P4, SiFive U-series), not for M-class equivalent RISC-V.
+
+**Not going to embedded, full stop:**
+`ica`, `pca`, `emd`, `ged`, `array_processing` — ICA and EMD especially are computationally brutal and allocation-heavy. These belong in a `full` feature flag gated behind `std`.
+
+---
+
+The play is **feature stratification**:
+
+```toml
+[features]
+default = ["embedded-core"]
+embedded-core = []        # fft, fir, iir, pll, agc, windowing, etc.
+embedded-extended = []    # stft, spectral, adaptive
+full = ["std"]            # ica, pca, emd, ged — pulls in std
+std = []
+```
+
+That way the crate is `no_std` by default and the ESP32-C3 user doesn't drag in ICA. The README markets the embedded-core tier to the RISC-V/ESP32 audience, and the `full` tier is honest about being desktop/linux-embedded only.
+
