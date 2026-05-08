@@ -453,6 +453,157 @@ pub fn design_gaussian(taps: usize, bt: f64) -> Vec<f64> {
     coeffs
 }
 
+// ─── Linear Phase Filter Analysis ─────────────────────────────────────────────
+
+/// Linear phase type of an FIR filter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LinearPhaseType {
+    /// Type I: symmetric coefficients, odd length.
+    Type1,
+    /// Type II: symmetric coefficients, even length.
+    Type2,
+    /// Type III: antisymmetric coefficients, odd length.
+    Type3,
+    /// Type IV: antisymmetric coefficients, even length.
+    Type4,
+    /// Not a linear phase filter.
+    None,
+}
+
+/// Check whether FIR filter coefficients are symmetric:
+/// `h[n] == h[N-1-n]` within `tolerance`.
+#[must_use]
+pub fn is_symmetric(coeffs: &[f64], tolerance: f64) -> bool {
+    let n = coeffs.len();
+    if n == 0 {
+        return true;
+    }
+    for i in 0..n / 2 {
+        if (coeffs[i] - coeffs[n - 1 - i]).abs() > tolerance {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check whether FIR filter coefficients are antisymmetric:
+/// `h[n] == -h[N-1-n]` within `tolerance`.
+#[must_use]
+pub fn is_antisymmetric(coeffs: &[f64], tolerance: f64) -> bool {
+    let n = coeffs.len();
+    if n == 0 {
+        return true;
+    }
+    for i in 0..n / 2 {
+        if (coeffs[i] + coeffs[n - 1 - i]).abs() > tolerance {
+            return false;
+        }
+    }
+    true
+}
+
+/// Determine the linear phase type of an FIR filter.
+///
+/// Returns one of four types or `None` if the filter is not linear phase.
+///
+/// * **Type I** – symmetric, odd length
+/// * **Type II** – symmetric, even length
+/// * **Type III** – antisymmetric, odd length
+/// * **Type IV** – antisymmetric, even length
+#[must_use]
+pub fn linear_phase_type(coeffs: &[f64], tolerance: f64) -> LinearPhaseType {
+    let n = coeffs.len();
+    if n == 0 {
+        return LinearPhaseType::None;
+    }
+    let odd = n % 2 == 1;
+    if is_symmetric(coeffs, tolerance) {
+        if odd { LinearPhaseType::Type1 } else { LinearPhaseType::Type2 }
+    } else if is_antisymmetric(coeffs, tolerance) {
+        if odd { LinearPhaseType::Type3 } else { LinearPhaseType::Type4 }
+    } else {
+        LinearPhaseType::None
+    }
+}
+
+/// Compute the group delay of an FIR filter at specified normalised
+/// frequencies (0..π).
+///
+/// For a linear-phase FIR of length N, the group delay is constant at
+/// `(N-1)/2`. This function computes the actual frequency-dependent group
+/// delay via the negative derivative of the phase response.
+///
+/// * `coeffs` – FIR filter coefficients
+/// * `freqs` – normalised angular frequencies at which to evaluate (rad/sample)
+/// * `delta` – finite-difference step size (e.g., 1e-6)
+#[must_use]
+pub fn group_delay(coeffs: &[f64], freqs: &[f64], delta: f64) -> Vec<f64> {
+    use std::f64::consts::PI;
+
+    let eval_phase = |w: f64| -> f64 {
+        let mut re = 0.0;
+        let mut im = 0.0;
+        for (n, &h) in coeffs.iter().enumerate() {
+            re += h * (w * n as f64).cos();
+            im -= h * (w * n as f64).sin();
+        }
+        im.atan2(re)
+    };
+
+    freqs
+        .iter()
+        .map(|&w| {
+            let p1 = eval_phase(w + delta);
+            let p0 = eval_phase(w - delta);
+            // Unwrap the phase difference
+            let mut dp = p1 - p0;
+            while dp > PI {
+                dp -= 2.0 * PI;
+            }
+            while dp < -PI {
+                dp += 2.0 * PI;
+            }
+            -dp / (2.0 * delta)
+        })
+        .collect()
+}
+
+/// Compute the frequency response (magnitude) of an FIR filter at specified
+/// normalised frequencies (0..π).
+#[must_use]
+pub fn frequency_response_magnitude(coeffs: &[f64], freqs: &[f64]) -> Vec<f64> {
+    freqs
+        .iter()
+        .map(|&w| {
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (n, &h) in coeffs.iter().enumerate() {
+                re += h * (w * n as f64).cos();
+                im -= h * (w * n as f64).sin();
+            }
+            (re * re + im * im).sqrt()
+        })
+        .collect()
+}
+
+/// Compute the phase response of an FIR filter at specified normalised
+/// frequencies (0..π).
+#[must_use]
+pub fn frequency_response_phase(coeffs: &[f64], freqs: &[f64]) -> Vec<f64> {
+    freqs
+        .iter()
+        .map(|&w| {
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (n, &h) in coeffs.iter().enumerate() {
+                re += h * (w * n as f64).cos();
+                im -= h * (w * n as f64).sin();
+            }
+            im.atan2(re)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +742,70 @@ mod tests {
         for i in 0..coeffs.len() / 2 {
             assert!((coeffs[i] - coeffs[coeffs.len() - 1 - i]).abs() < 1e-10);
         }
+    }
+
+    #[test]
+    fn lowpass_is_symmetric_type1() {
+        let coeffs = design_lowpass(51, 0.25);
+        assert!(is_symmetric(&coeffs, 1e-10));
+        assert!(!is_antisymmetric(&coeffs, 1e-10));
+        assert_eq!(linear_phase_type(&coeffs, 1e-10), LinearPhaseType::Type1);
+    }
+
+    #[test]
+    fn even_symmetric_is_type2() {
+        let coeffs = vec![1.0, 2.0, 3.0, 3.0, 2.0, 1.0];
+        assert!(is_symmetric(&coeffs, 1e-10));
+        assert_eq!(linear_phase_type(&coeffs, 1e-10), LinearPhaseType::Type2);
+    }
+
+    #[test]
+    fn antisymmetric_odd_is_type3() {
+        let coeffs = vec![1.0, 2.0, 0.0, -2.0, -1.0];
+        assert!(is_antisymmetric(&coeffs, 1e-10));
+        assert_eq!(linear_phase_type(&coeffs, 1e-10), LinearPhaseType::Type3);
+    }
+
+    #[test]
+    fn antisymmetric_even_is_type4() {
+        let coeffs = vec![1.0, 2.0, -2.0, -1.0];
+        assert!(is_antisymmetric(&coeffs, 1e-10));
+        assert_eq!(linear_phase_type(&coeffs, 1e-10), LinearPhaseType::Type4);
+    }
+
+    #[test]
+    fn non_linear_phase() {
+        let coeffs = vec![1.0, 2.0, 3.0]; // not symmetric or antisymmetric
+        assert_eq!(linear_phase_type(&coeffs, 1e-10), LinearPhaseType::None);
+    }
+
+    #[test]
+    fn group_delay_of_symmetric_is_constant() {
+        let coeffs = design_lowpass(51, 0.25);
+        let expected_delay = (coeffs.len() - 1) as f64 / 2.0; // 25.0
+        let freqs: Vec<f64> = (1..50).map(|i| std::f64::consts::PI * i as f64 / 50.0).collect();
+        let gd = group_delay(&coeffs, &freqs, 1e-6);
+        for (i, &d) in gd.iter().enumerate() {
+            assert!(
+                (d - expected_delay).abs() < 0.1,
+                "Group delay at freq index {i}: {d} != {expected_delay}"
+            );
+        }
+    }
+
+    #[test]
+    fn freq_response_magnitude_at_dc() {
+        let coeffs = design_lowpass(51, 0.25);
+        let mag = frequency_response_magnitude(&coeffs, &[0.0]);
+        // At DC, magnitude should be the sum of coefficients ≈ 1.0
+        assert!((mag[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn freq_response_phase_at_dc() {
+        let coeffs = design_lowpass(51, 0.25);
+        let phase = frequency_response_phase(&coeffs, &[0.0]);
+        // At DC, phase should be 0
+        assert!(phase[0].abs() < 1e-6);
     }
 }

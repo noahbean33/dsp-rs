@@ -96,6 +96,138 @@ pub fn generate_chirp(
         .collect()
 }
 
+/// Generate a chirp (frequency-sweep) signal using cosine instead of sine.
+///
+/// Matches the form used in the DSP on ARM textbook:
+/// `x[n] = amplitude * cos(w1*n + (w2 - w1) * n² / (2*(N-1)))`
+///
+/// * `w1` – start angular frequency (rad/sample)
+/// * `w2` – end angular frequency (rad/sample)
+#[must_use]
+pub fn generate_chirp_cosine(length: usize, amplitude: f64, w1: f64, w2: f64) -> Vec<f64> {
+    if length <= 1 {
+        return vec![amplitude; length];
+    }
+    let n_minus_1 = (length - 1) as f64;
+    (0..length)
+        .map(|n| {
+            let nf = n as f64;
+            amplitude * (w1 * nf + (w2 - w1) * nf * nf / (2.0 * n_minus_1)).cos()
+        })
+        .collect()
+}
+
+/// Generate a logarithmic (exponential) chirp signal.
+///
+/// Frequency sweeps exponentially from `f0` to `f1` over `length` samples.
+///
+/// `x[n] = amplitude * sin(2π * f0 * (k^t - 1) / ln(k))`
+/// where `k = f1/f0` and `t = n / sample_rate`.
+#[must_use]
+pub fn generate_chirp_log(
+    length: usize,
+    amplitude: f64,
+    f0: f64,
+    f1: f64,
+    sample_rate: f64,
+) -> Vec<f64> {
+    if length == 0 || f0 <= 0.0 || f1 <= 0.0 {
+        return vec![0.0; length];
+    }
+    let duration = length as f64 / sample_rate;
+    let k = (f1 / f0).powf(1.0 / duration);
+    let ln_k = k.ln();
+    if ln_k.abs() < 1e-30 {
+        // f0 ≈ f1, degenerate to constant-frequency sine
+        return generate_sine(length, amplitude, f0, sample_rate, 0.0);
+    }
+    (0..length)
+        .map(|n| {
+            let t = n as f64 / sample_rate;
+            amplitude * (2.0 * PI * f0 * (k.powf(t) - 1.0) / ln_k).sin()
+        })
+        .collect()
+}
+
+// ─── Waveform Lookup Table Generators ─────────────────────────────────────────
+
+/// Generate a quantised sine lookup table suitable for DAC output.
+///
+/// Returns `samples_per_period` integer values in the range `[0, max_value]`.
+///
+/// * `samples_per_period` – number of samples in one full cycle
+/// * `max_value` – maximum integer value (e.g., 4095 for 12-bit DAC)
+#[must_use]
+pub fn generate_sine_lut(samples_per_period: usize, max_value: u16) -> Vec<u16> {
+    let half = max_value as f64 / 2.0;
+    (0..samples_per_period)
+        .map(|n| {
+            let theta = 2.0 * PI * n as f64 / samples_per_period as f64;
+            ((theta.sin() * half) + half + 0.5) as u16
+        })
+        .collect()
+}
+
+/// Generate a quantised cosine lookup table suitable for DAC output.
+///
+/// Returns `samples_per_period` integer values in the range `[0, max_value]`.
+#[must_use]
+pub fn generate_cosine_lut(samples_per_period: usize, max_value: u16) -> Vec<u16> {
+    let half = max_value as f64 / 2.0;
+    (0..samples_per_period)
+        .map(|n| {
+            let theta = 2.0 * PI * n as f64 / samples_per_period as f64;
+            ((theta.cos() * half) + half + 0.5) as u16
+        })
+        .collect()
+}
+
+/// Generate a quantised square wave lookup table suitable for DAC output.
+///
+/// First half of the period is `max_value`, second half is `0`.
+#[must_use]
+pub fn generate_square_lut(samples_per_period: usize, max_value: u16) -> Vec<u16> {
+    (0..samples_per_period)
+        .map(|n| if n < samples_per_period / 2 { max_value } else { 0 })
+        .collect()
+}
+
+/// Generate a quantised sawtooth lookup table suitable for DAC output.
+///
+/// Linearly ramps from `0` to `max_value` over the period.
+#[must_use]
+pub fn generate_sawtooth_lut(samples_per_period: usize, max_value: u16) -> Vec<u16> {
+    if samples_per_period <= 1 {
+        return vec![0; samples_per_period];
+    }
+    (0..samples_per_period)
+        .map(|n| (max_value as f64 * n as f64 / (samples_per_period - 1) as f64 + 0.5) as u16)
+        .collect()
+}
+
+/// Generate a quantised triangle wave lookup table suitable for DAC output.
+///
+/// Ramps up to `max_value` at the midpoint, then back down to `0`.
+#[must_use]
+pub fn generate_triangle_lut(samples_per_period: usize, max_value: u16) -> Vec<u16> {
+    if samples_per_period == 0 {
+        return Vec::new();
+    }
+    let half = samples_per_period / 2;
+    (0..samples_per_period)
+        .map(|n| {
+            if half == 0 {
+                return 0;
+            }
+            if n <= half {
+                (max_value as f64 * n as f64 / half as f64 + 0.5) as u16
+            } else {
+                (max_value as f64 * (samples_per_period - n) as f64 / half as f64 + 0.5) as u16
+            }
+        })
+        .collect()
+}
+
 /// Generate a square wave signal.
 ///
 /// `x[n] = amplitude * sign(sin(2π * frequency * n / sample_rate + phase))`
@@ -342,5 +474,79 @@ mod tests {
         // With default phase=0, triangle should start near +amplitude
         let s = generate_triangle(100, 2.0, 10.0, 100.0, 0.0);
         assert!((s[0] - 2.0).abs() < 0.3);
+    }
+
+    #[test]
+    fn chirp_cosine_correct_length_and_starts_at_amplitude() {
+        let c = generate_chirp_cosine(1024, 1.0, 0.0, PI);
+        assert_eq!(c.len(), 1024);
+        // cos(0) = 1, so first sample should be amplitude
+        assert!((c[0] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn chirp_cosine_single_sample() {
+        let c = generate_chirp_cosine(1, 2.5, 0.0, PI);
+        assert_eq!(c.len(), 1);
+        assert!((c[0] - 2.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn chirp_log_correct_length() {
+        let c = generate_chirp_log(500, 1.0, 100.0, 1000.0, 8000.0);
+        assert_eq!(c.len(), 500);
+        // All values within [-amplitude, amplitude]
+        assert!(c.iter().all(|&v| v.abs() <= 1.0 + 1e-10));
+    }
+
+    #[test]
+    fn chirp_log_equal_freqs_is_sine() {
+        let c = generate_chirp_log(100, 1.0, 440.0, 440.0, 8000.0);
+        let s = generate_sine(100, 1.0, 440.0, 8000.0, 0.0);
+        for (a, b) in c.iter().zip(s.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn sine_lut_range_and_length() {
+        let lut = generate_sine_lut(160, 4095);
+        assert_eq!(lut.len(), 160);
+        assert!(lut.iter().all(|&v| v <= 4095));
+    }
+
+    #[test]
+    fn cosine_lut_starts_at_max() {
+        let lut = generate_cosine_lut(160, 4095);
+        // cos(0) = 1, so first value should be near max_value
+        assert!(lut[0] >= 4090);
+    }
+
+    #[test]
+    fn square_lut_values() {
+        let lut = generate_square_lut(10, 4095);
+        assert_eq!(lut.len(), 10);
+        assert!(lut[..5].iter().all(|&v| v == 4095));
+        assert!(lut[5..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn sawtooth_lut_ramps() {
+        let lut = generate_sawtooth_lut(100, 4095);
+        assert_eq!(lut.len(), 100);
+        assert_eq!(lut[0], 0);
+        assert_eq!(lut[99], 4095);
+        // Should be monotonically non-decreasing
+        for w in lut.windows(2) {
+            assert!(w[1] >= w[0]);
+        }
+    }
+
+    #[test]
+    fn triangle_lut_peaks_at_midpoint() {
+        let lut = generate_triangle_lut(100, 4095);
+        assert_eq!(lut.len(), 100);
+        assert_eq!(lut[0], 0);
+        assert_eq!(lut[50], 4095);
     }
 }

@@ -763,6 +763,76 @@ pub fn instantaneous_frequency(leading_phase: &[f64], lagging_phase: &[f64]) -> 
         .collect()
 }
 
+// ─── DTFSE (Discrete-Time Fourier Series Expansion) ──────────────────────────
+
+/// Discrete-Time Fourier Series Expansion (DTFSE).
+///
+/// Reconstructs a real-valued time-domain signal from its DFT coefficients
+/// using only the first `k_harmonics` harmonics. This provides a partial
+/// inverse DFT that approximates the original signal with fewer frequency
+/// components.
+///
+/// * `dft_coeffs` – complex DFT coefficients (length N)
+/// * `k_harmonics` – number of harmonics to use (1..=N)
+///
+/// Returns a real-valued signal of length N.
+///
+/// # Formula
+/// ```text
+/// y[n] = (1/N) * Σ_{k=0}^{K} |X[k]| * cos(2π·k·n/N + ∠X[k])
+/// ```
+#[must_use]
+pub fn dtfse(dft_coeffs: &[Complex], k_harmonics: usize) -> Vec<f64> {
+    let n = dft_coeffs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = k_harmonics.min(n);
+    let size = n as f64;
+    (0..n)
+        .map(|sample| {
+            dft_coeffs
+                .iter()
+                .take(k)
+                .enumerate()
+                .map(|(ki, coeff)| {
+                    let amplitude = coeff.norm();
+                    let phase = coeff.arg();
+                    amplitude * (2.0 * PI * ki as f64 * sample as f64 / size + phase).cos() / size
+                })
+                .sum()
+        })
+        .collect()
+}
+
+/// DTFSE with a specified output length (for zero-padded DFT coefficients).
+///
+/// Same as [`dtfse`] but allows the output length to differ from the
+/// number of DFT coefficients.
+#[must_use]
+pub fn dtfse_with_length(dft_coeffs: &[Complex], k_harmonics: usize, output_len: usize) -> Vec<f64> {
+    let n = dft_coeffs.len();
+    if n == 0 || output_len == 0 {
+        return Vec::new();
+    }
+    let k = k_harmonics.min(n);
+    let size = n as f64;
+    (0..output_len)
+        .map(|sample| {
+            dft_coeffs
+                .iter()
+                .take(k)
+                .enumerate()
+                .map(|(ki, coeff)| {
+                    let amplitude = coeff.norm();
+                    let phase = coeff.arg();
+                    amplitude * (2.0 * PI * ki as f64 * sample as f64 / size + phase).cos() / size
+                })
+                .sum()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1104,67 @@ mod tests {
         let inst = instantaneous_frequency(&leading, &lagging);
         for &f in &inst {
             assert!((f - freq).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn dtfse_full_harmonics_recovers_dc() {
+        // DC signal: DFT of [1,1,1,1] → [4,0,0,0]
+        let n = 4;
+        let signal: Vec<f64> = vec![1.0; n];
+        let mut dft_data: Vec<Complex> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        fft(&mut dft_data);
+        let recovered = dtfse(&dft_data, n);
+        for (i, &v) in recovered.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-6, "Sample {i}: {v} != 1.0");
+        }
+    }
+
+    #[test]
+    fn dtfse_reconstructs_square_wave() {
+        // Square wave: [1,1,...,0,0,...] of length 16
+        let n = 16;
+        let signal: Vec<f64> = (0..n).map(|i| if i < n / 2 { 1.0 } else { 0.0 }).collect();
+        let mut dft_data: Vec<Complex> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        fft(&mut dft_data);
+        // Full reconstruction should recover the original
+        let recovered = dtfse(&dft_data, n);
+        for (i, (&orig, &rec)) in signal.iter().zip(recovered.iter()).enumerate() {
+            assert!((orig - rec).abs() < 1e-6, "Sample {i}: {orig} != {rec}");
+        }
+    }
+
+    #[test]
+    fn dtfse_fewer_harmonics_is_smoother() {
+        let n = 16;
+        let signal: Vec<f64> = (0..n).map(|i| if i < n / 2 { 1.0 } else { 0.0 }).collect();
+        let mut dft_data: Vec<Complex> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        fft(&mut dft_data);
+        let approx = dtfse(&dft_data, 3);
+        assert_eq!(approx.len(), n);
+        // With only 3 harmonics the sharp edges should be smoothed
+        // Check that max is less than the original
+        let max_approx = approx.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_approx < 1.0 + 0.01);
+    }
+
+    #[test]
+    fn dtfse_empty_returns_empty() {
+        let result = dtfse(&[], 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dtfse_with_length_works() {
+        let n = 4;
+        let signal: Vec<f64> = vec![1.0; n];
+        let mut dft_data: Vec<Complex> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        fft(&mut dft_data);
+        let recovered = dtfse_with_length(&dft_data, n, 8);
+        assert_eq!(recovered.len(), 8);
+        // First N samples should match the DC reconstruction
+        for &v in &recovered[..n] {
+            assert!((v - 1.0).abs() < 1e-6);
         }
     }
 }

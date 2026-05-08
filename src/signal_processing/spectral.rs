@@ -316,6 +316,66 @@ pub fn magnitude_squared_coherence(
         .collect()
 }
 
+// ─── SNR Spectrum ─────────────────────────────────────────────────────────────
+
+/// Compute the Signal-to-Noise Ratio spectrum.
+///
+/// For each frequency bin, the SNR is the ratio of the power at that bin to the
+/// average power in surrounding (neighbor) bins, excluding a small skip region
+/// immediately adjacent to the target bin.
+///
+/// This is commonly used in steady-state evoked potential (SSVEP) analysis to
+/// identify frequency-tagged responses.
+///
+/// * `power_spectrum` – power spectral density (one-sided)
+/// * `skip_bins` – number of bins to skip on each side of the target (e.g., 5)
+/// * `neighbor_bins` – number of bins to average on each side (e.g., 20)
+///
+/// Returns SNR values for each frequency bin. Bins near the edges where
+/// neighbors cannot be fully computed are set to 1.0 (0 dB).
+#[must_use]
+pub fn snr_spectrum(power_spectrum: &[f64], skip_bins: usize, neighbor_bins: usize) -> Vec<f64> {
+    let n = power_spectrum.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let total_offset = skip_bins + neighbor_bins;
+    let mut snr = vec![1.0; n];
+
+    for i in total_offset..n.saturating_sub(total_offset) {
+        // Average power in neighbor bins (excluding skip region)
+        let mut denom = 0.0;
+        let mut count = 0;
+
+        // Lower neighbors
+        for j in (i - total_offset)..(i - skip_bins) {
+            denom += power_spectrum[j];
+            count += 1;
+        }
+        // Upper neighbors
+        for j in (i + skip_bins + 1)..=(i + total_offset).min(n - 1) {
+            denom += power_spectrum[j];
+            count += 1;
+        }
+
+        if count > 0 && denom > 1e-30 {
+            snr[i] = power_spectrum[i] / (denom / count as f64);
+        }
+    }
+
+    snr
+}
+
+/// Compute SNR spectrum in decibels.
+#[must_use]
+pub fn snr_spectrum_db(power_spectrum: &[f64], skip_bins: usize, neighbor_bins: usize) -> Vec<f64> {
+    snr_spectrum(power_spectrum, skip_bins, neighbor_bins)
+        .iter()
+        .map(|&s| 10.0 * s.max(1e-30).log10())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +460,39 @@ mod tests {
         let window = vec![1.0; 64];
         // Signal shorter than segment → empty
         assert!(cross_power_spectrum(&signal, &signal, 64, 32, &window).is_empty());
+    }
+
+    #[test]
+    fn snr_spectrum_peak_at_signal_bin() {
+        // Create a power spectrum with a spike at bin 50
+        let n = 200;
+        let mut psd = vec![1.0; n]; // flat noise floor
+        psd[50] = 100.0; // signal peak
+
+        let snr = snr_spectrum(&psd, 2, 10);
+        assert_eq!(snr.len(), n);
+        // SNR at the peak should be much larger than 1
+        assert!(snr[50] > 10.0);
+        // SNR at noise bins should be near 1
+        assert!((snr[100] - 1.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn snr_spectrum_db_peak() {
+        let n = 200;
+        let mut psd = vec![1.0; n];
+        psd[50] = 50.0;
+
+        let snr_db = snr_spectrum_db(&psd, 2, 10);
+        assert_eq!(snr_db.len(), n);
+        // Peak should be positive dB
+        assert!(snr_db[50] > 10.0);
+        // Noise should be ~0 dB
+        assert!(snr_db[100].abs() < 3.0);
+    }
+
+    #[test]
+    fn snr_spectrum_empty() {
+        assert!(snr_spectrum(&[], 2, 10).is_empty());
     }
 }
